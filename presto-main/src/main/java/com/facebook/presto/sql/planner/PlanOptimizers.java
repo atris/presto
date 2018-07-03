@@ -88,6 +88,7 @@ import com.facebook.presto.sql.planner.iterative.rule.TransformCorrelatedInPredi
 import com.facebook.presto.sql.planner.iterative.rule.TransformCorrelatedLateralJoinToJoin;
 import com.facebook.presto.sql.planner.iterative.rule.TransformCorrelatedScalarAggregationToJoin;
 import com.facebook.presto.sql.planner.iterative.rule.TransformCorrelatedScalarSubquery;
+import com.facebook.presto.sql.planner.iterative.rule.TransformCorrelatedSubqueriesWithEqualityCond;
 import com.facebook.presto.sql.planner.iterative.rule.TransformExistsApplyToLateralNode;
 import com.facebook.presto.sql.planner.iterative.rule.TransformSpatialPredicates;
 import com.facebook.presto.sql.planner.iterative.rule.TransformUncorrelatedInPredicateSubqueryToSemiJoin;
@@ -365,7 +366,8 @@ public class PlanOptimizers
                         ruleStats,
                         statsCalculator,
                         estimatedExchangesCostCalculator,
-                        ImmutableSet.of(new EliminateCrossJoins())), // This can pull up Filter and Project nodes from between Joins, so we need to push them down again
+                        ImmutableSet.of(new EliminateCrossJoins(), // This can pull up Filter and Project nodes from between Joins, so we need to push them down again
+                                        new TransformCorrelatedSubqueriesWithEqualityCond())),
                 predicatePushDown,
                 simplifyOptimizer, // Should be always run after PredicatePushDown
                 new IterativeOptimizer(
