@@ -6108,6 +6108,25 @@ public abstract class AbstractTestQueries
     }
 
     @Test
+    public void testCorrelatedSubqueryToSemiJoinConversionWithAggregation()
+    {
+        assertQuery("select count(*) from lineitem o where EXISTS (SELECT orderkey from lineitem WHERE orderkey = o.orderkey)");
+    }
+
+    @Test
+    public void testCorrelatedSubqueryToSemiJoinConversion()
+    {
+        assertQuery("select * from lineitem o where EXISTS (SELECT orderkey from lineitem WHERE orderkey = o.orderkey)");
+    }
+
+    @Test
+    public void testCorrelatedSubqueryWithNonEquiPredicate()
+    {
+        assertQuery("select count(*) from lineitem, nation where orderkey > nationkey group by orderkey");
+    }
+
+
+    @Test
     public void testCorrelatedNonAggregationScalarSubqueries()
     {
         String subqueryReturnedTooManyRows = "Scalar sub-query has returned multiple rows";
