@@ -136,6 +136,11 @@ public class PushAggregationThroughOuterJoin
 
         JoinNode rewrittenJoin;
         if (join.getType() == JoinNode.Type.LEFT) {
+            if (aggregation.hasNonEmptyGroupingSet() &&
+                    !(rewrittenAggregation.hasNonEmptyGroupingSet())) {
+                return Result.empty();
+            }
+
             rewrittenJoin = new JoinNode(
                     join.getId(),
                     join.getType(),

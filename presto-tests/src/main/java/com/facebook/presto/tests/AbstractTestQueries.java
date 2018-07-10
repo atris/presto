@@ -2299,6 +2299,13 @@ public abstract class AbstractTestQueries
     }
 
     @Test
+    public void testAggregationPushdownDisabledDueToAggPushdownJoinSide()
+    {
+        assertQuery(
+                "select x, count(*) from (select * from (values (1)) t(x) left join (select * from (values (1)) t2(y) where false) t2(y) on true) group by x");
+    }
+
+    @Test
     public void testOuterJoinWithComplexCorrelatedSubquery()
     {
         QueryTemplate.Parameter type = parameter("type");
