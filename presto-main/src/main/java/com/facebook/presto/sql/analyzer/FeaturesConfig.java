@@ -115,6 +115,7 @@ public class FeaturesConfig
     private DataSize filterAndProjectMinOutputPageSize = new DataSize(500, KILOBYTE);
     private int filterAndProjectMinOutputPageRowCount = 256;
     private int maxGroupingSets = 2048;
+    private boolean addOptimizationForSemiJoin = true;
 
     public double getCpuCostWeight()
     {
@@ -691,6 +692,18 @@ public class FeaturesConfig
     public FeaturesConfig setPushAggregationThroughJoin(boolean value)
     {
         this.pushAggregationThroughJoin = value;
+        return this;
+    }
+
+    public boolean isAddOptimizationForSemiJoin()
+    {
+        return addOptimizationForSemiJoin;
+    }
+
+    @Config("optimizer.add-optimization-for-semijoin")
+    public FeaturesConfig setAddOptimizationForSemiJoin(boolean value)
+    {
+        this.addOptimizationForSemiJoin = value;
         return this;
     }
 

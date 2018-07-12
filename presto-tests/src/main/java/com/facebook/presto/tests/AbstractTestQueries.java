@@ -4308,6 +4308,12 @@ public abstract class AbstractTestQueries
     }
 
     @Test
+    public void testAddPartialAggregationBelowSemiJoin()
+    {
+        assertQuery("select count(*) from lineitem where orderkey IN (SELECT orderkey from lineitem)");
+    }
+
+    @Test
     public void testDuplicateFields()
     {
         assertQuery(

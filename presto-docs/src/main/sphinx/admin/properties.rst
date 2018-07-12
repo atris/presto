@@ -455,6 +455,15 @@ Optimizer Properties
     queries that have very selective joins. This can also be specified on a per-query basis using
     the ``push_aggregation_through_join`` session property.
 
+``optimizer.add-optimization-for-semijoin``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+    * **Type:** ``boolean``
+    * **Default value:** ``true``
+
+    For SemiJoins, a possible optimization is to add a partial aggregation below a SemiJoin which
+    will allow the SemiJoin to process only distinct values, thus eliminating duplicates.
+
 ``optimizer.push-table-write-through-union``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

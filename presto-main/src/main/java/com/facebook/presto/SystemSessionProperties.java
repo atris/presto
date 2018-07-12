@@ -94,6 +94,7 @@ public final class SystemSessionProperties
     public static final String USE_MARK_DISTINCT = "use_mark_distinct";
     public static final String PREFER_PARTITIAL_AGGREGATION = "prefer_partial_aggregation";
     public static final String MAX_GROUPING_SETS = "max_grouping_sets";
+    public static final String ADD_OPTIMIZATION_FOR_SEMIJOIN = "add_optimization_for_semijoin";
 
     private final List<PropertyMetadata<?>> sessionProperties;
 
@@ -387,6 +388,11 @@ public final class SystemSessionProperties
                         featuresConfig.isPushAggregationThroughJoin(),
                         false),
                 booleanSessionProperty(
+                        ADD_OPTIMIZATION_FOR_SEMIJOIN,
+                        "Allow adding partial aggregation below semijoin",
+                        featuresConfig.isAddOptimizationForSemiJoin(),
+                        false),
+                booleanSessionProperty(
                         PUSH_PARTIAL_AGGREGATION_THROUGH_JOIN,
                         "Push partial aggregations below joins",
                         false,
@@ -673,6 +679,11 @@ public final class SystemSessionProperties
     public static boolean shouldPushAggregationThroughJoin(Session session)
     {
         return session.getSystemProperty(PUSH_AGGREGATION_THROUGH_JOIN, Boolean.class);
+    }
+
+    public static boolean isAllowOptimizationForSemiJoin(Session session)
+    {
+        return session.getSystemProperty(ADD_OPTIMIZATION_FOR_SEMIJOIN, Boolean.class);
     }
 
     public static boolean isPushAggregationThroughJoin(Session session)

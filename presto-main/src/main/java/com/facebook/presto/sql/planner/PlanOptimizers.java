@@ -23,6 +23,7 @@ import com.facebook.presto.sql.parser.SqlParser;
 import com.facebook.presto.sql.planner.iterative.IterativeOptimizer;
 import com.facebook.presto.sql.planner.iterative.Rule;
 import com.facebook.presto.sql.planner.iterative.rule.AddIntermediateAggregations;
+import com.facebook.presto.sql.planner.iterative.rule.AddPartialAggregationBelowSemiJoin;
 import com.facebook.presto.sql.planner.iterative.rule.CanonicalizeExpressions;
 import com.facebook.presto.sql.planner.iterative.rule.CreatePartialTopN;
 import com.facebook.presto.sql.planner.iterative.rule.DesugarAtTimeZone;
@@ -315,7 +316,8 @@ public class PlanOptimizers
                                 new TransformCorrelatedInPredicateToJoin(), // must be run after PruneUnreferencedOutputs
                                 new TransformCorrelatedScalarSubquery(), // must be run after TransformCorrelatedScalarAggregationToJoin
                                 new TransformCorrelatedLateralJoinToJoin(),
-                                new ImplementFilteredAggregations())),
+                                new ImplementFilteredAggregations(),
+                                new AddPartialAggregationBelowSemiJoin())),
                 new TransformCorrelatedSingleRowSubqueryToProject(),
                 new CheckSubqueryNodesAreRewritten(),
                 predicatePushDown,
