@@ -250,6 +250,22 @@ public abstract class AbstractTestQueries
     }
 
     @Test
+    public void testOut1()
+    {
+        // Test for lambda expression without capture can be found in TestLambdaExpression
+
+        assertQuery("SELECT 1 FROM nation n WHERE 1 = (SELECT sum(n.nationkey))");
+    }
+
+    @Test
+    public void testOut2()
+    {
+        // Test for lambda expression without capture can be found in TestLambdaExpression
+
+        assertQuery("SELECT 1 FROM nation n WHERE 1 = (SELECT cast(n.nationkey as decimal))");
+    }
+
+    @Test
     public void testLambdaInAggregationContext()
     {
         assertQuery("SELECT apply(sum(x), i -> i * i) FROM (VALUES 1, 2, 3, 4, 5) t(x)", "SELECT 225");
