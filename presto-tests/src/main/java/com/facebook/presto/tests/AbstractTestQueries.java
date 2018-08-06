@@ -6072,6 +6072,11 @@ public abstract class AbstractTestQueries
     }
 
     @Test
+    public void testFailingAggregateWithFilter() {
+        assertQuery("select sum(1 / a) filter (where a <> 0) from (values (1), (0)) t(a)");
+    }
+
+    @Test
     public void testCorrelatedScalarSubqueries()
     {
         assertQuery("SELECT (SELECT n.nationkey) FROM nation n");
