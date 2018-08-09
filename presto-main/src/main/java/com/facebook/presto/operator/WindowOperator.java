@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.operator;
 
+import com.facebook.presto.memory.context.AggregatedMemoryContext;
 import com.facebook.presto.memory.context.LocalMemoryContext;
 import com.facebook.presto.operator.window.FramedWindowFunction;
 import com.facebook.presto.operator.window.WindowPartition;
@@ -35,6 +36,10 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
 import java.util.stream.Stream;
 
+import static com.facebook.presto.operator.WorkProcessor.ProcessorState;
+import static com.facebook.presto.operator.WorkProcessor.ProcessorState.finished;
+import static com.facebook.presto.operator.WorkProcessor.ProcessorState.needsMoreData;
+import static com.facebook.presto.operator.WorkProcessor.ProcessorState.ofResult;
 import static com.facebook.presto.spi.block.SortOrder.ASC_NULLS_LAST;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkPositionIndex;
@@ -154,7 +159,6 @@ public class WindowOperator
     private enum State
     {
         NEEDS_INPUT,
-        HAS_OUTPUT,
         FINISHING,
         FINISHED
     }
@@ -181,8 +185,6 @@ public class WindowOperator
     private AtomicReference<Optional<WindowInfo.DriverWindowInfo>> driverWindowInfo = new AtomicReference<>(Optional.empty());
 
     private State state = State.NEEDS_INPUT;
-
-    private WindowPartition partition;
 
     private Page pendingInput;
 
@@ -229,6 +231,7 @@ public class WindowOperator
         this.pagesIndex = pagesIndexFactory.newPagesIndex(sourceTypes, expectedPositions);
         this.preGroupedChannels = Ints.toArray(preGroupedChannels);
         this.preGroupedPartitionHashStrategy = pagesIndex.createPagesHashStrategy(preGroupedChannels, OptionalInt.empty());
+
         List<Integer> unGroupedPartitionChannels = partitionChannels.stream()
                 .filter(channel -> !preGroupedChannels.contains(channel))
                 .collect(toImmutableList());
@@ -273,10 +276,8 @@ public class WindowOperator
         if (state == State.FINISHING || state == State.FINISHED) {
             return;
         }
-        if (state == State.NEEDS_INPUT) {
-            // Since was waiting for more input, prepare what we have for output since we will not be getting any more input
-            finishPagesIndex();
-        }
+
+        //getOutput will handle processing the existing buffer and preparing it for output
         state = State.FINISHING;
     }
 
@@ -304,60 +305,17 @@ public class WindowOperator
         }
 
         pendingInput = page;
-        if (processPendingInput()) {
-            state = State.HAS_OUTPUT;
-        }
+        processPendingInput();
         localUserMemoryContext.setBytes(pagesIndex.getEstimatedSize().toBytes());
     }
 
     /**
      * @return true if a full group has been buffered after processing the pendingInput, false otherwise
      */
-    private boolean processPendingInput()
+    private void processPendingInput()
     {
         checkState(pendingInput != null);
-        pendingInput = updatePagesIndex(pendingInput);
-
-        // If we have unused input or are finishing, then we have buffered a full group
-        if (pendingInput != null || state == State.FINISHING) {
-            finishPagesIndex();
-            return true;
-        }
-        else {
-            return false;
-        }
-    }
-
-    /**
-     * @return the unused section of the page, or null if fully applied.
-     * pagesIndex guaranteed to have at least one row after this method returns
-     */
-    private Page updatePagesIndex(Page page)
-    {
-        checkArgument(page.getPositionCount() > 0);
-
-        // TODO: Fix pagesHashStrategy to allow specifying channels for comparison, it currently requires us to rearrange the right side blocks in consecutive channel order
-        Page preGroupedPage = rearrangePage(page, preGroupedChannels);
-        if (pagesIndex.getPositionCount() == 0 || pagesIndex.positionEqualsRow(preGroupedPartitionHashStrategy, 0, 0, preGroupedPage)) {
-            // Find the position where the pre-grouped columns change
-            int groupEnd = findGroupEnd(preGroupedPage, preGroupedPartitionHashStrategy, 0);
-
-            // Add the section of the page that contains values for the current group
-            pagesIndex.addPage(page.getRegion(0, groupEnd));
-
-            if (page.getPositionCount() - groupEnd > 0) {
-                // Save the remaining page, which may contain multiple partitions
-                return page.getRegion(groupEnd, page.getPositionCount() - groupEnd);
-            }
-            else {
-                // Page fully consumed
-                return null;
-            }
-        }
-        else {
-            // We had previous results buffered, but the new page starts with new group values
-            return page;
-        }
+        pendingInput = updatePagesIndex(pendingInput, pagesIndex, preGroupedChannels, preGroupedPartitionHashStrategy);
     }
 
     private static Page rearrangePage(Page page, int[] channels)
@@ -376,74 +334,64 @@ public class WindowOperator
             return null;
         }
 
-        Page page = extractOutput();
-        localUserMemoryContext.setBytes(pagesIndex.getEstimatedSize().toBytes());
-        return page;
-    }
-
-    private Page extractOutput()
-    {
-        // INVARIANT: pagesIndex contains the full grouped & sorted data for one or more partitions
-
-        // Iterate through the positions sequentially until we have one full page
-        while (!pageBuilder.isFull()) {
-            if (partition == null || !partition.hasNext()) {
-                int partitionStart = partition == null ? 0 : partition.getPartitionEnd();
-
-                if (partitionStart >= pagesIndex.getPositionCount()) {
-                    // Finished all of the partitions in the current pagesIndex
-                    partition = null;
-                    pagesIndex.clear();
-
-                    // Try to extract more partitions from the pendingInput
-                    if (pendingInput != null && processPendingInput()) {
-                        partitionStart = 0;
-                    }
-                    else if (state == State.FINISHING) {
-                        state = State.FINISHED;
-                        // Output the remaining page if we have anything buffered
-                        if (!pageBuilder.isEmpty()) {
-                            Page page = pageBuilder.build();
-                            pageBuilder.reset();
-                            return page;
-                        }
-                        return null;
-                    }
-                    else {
-                        state = State.NEEDS_INPUT;
-                        return null;
-                    }
+        WorkProcessor<Page> inputPages = WorkProcessor.create(new WorkProcessor.Process<Page>()
+        {
+            @Override
+            public ProcessorState<Page> process()
+            {
+                if (pendingInput != null) {
+                    return ProcessorState.ofResult(pendingInput);
                 }
 
-                int partitionEnd = findGroupEnd(pagesIndex, unGroupedPartitionHashStrategy, partitionStart);
-                partition = new WindowPartition(pagesIndex, partitionStart, partitionEnd, outputChannels, windowFunctions, peerGroupHashStrategy);
-                windowInfo.addPartition(partition);
+                return null;
             }
+        });
 
-            partition.processNextRow(pageBuilder);
+        WorkProcessor<Page> outputPages = null;
+
+        if (pendingInput != null) {
+            outputPages = inputPages
+                    .transform(new ProducePagesIndex(
+                            operatorContext.aggregateUserMemoryContext(),
+                            pagesIndex,
+                            preGroupedChannels,
+                            preGroupedPartitionHashStrategy,
+                            orderChannels,
+                            ordering,
+                            windowInfo))
+                    .transform(new ProducePartitions(windowFunctions, operatorContext.aggregateUserMemoryContext(), windowInfo))
+                    .transform(new ProduceWindowResultsPerPartition(pageBuilder, operatorContext.aggregateUserMemoryContext()));
+        }
+        else if (pagesIndex != null){
+            WorkProcessor<PagesIndex> inputPagesIndex = WorkProcessor.create(new WorkProcessor.Process<PagesIndex>()
+            {
+                @Override
+                public ProcessorState<PagesIndex> process()
+                {
+                    if (pagesIndex != null) {
+                        return ProcessorState.ofResult(pagesIndex);
+                    }
+
+                    return null;
+                }
+            });
+
+            outputPages = inputPagesIndex
+                    .transform(new ProducePartitions(windowFunctions, operatorContext.aggregateUserMemoryContext(), windowInfo))
+                    .transform(new ProduceWindowResultsPerPartition(pageBuilder, operatorContext.aggregateUserMemoryContext()));
         }
 
-        Page page = pageBuilder.build();
-        pageBuilder.reset();
-        return page;
-    }
-
-    private void sortPagesIndexIfNecessary()
-    {
-        if (pagesIndex.getPositionCount() > 1 && !orderChannels.isEmpty()) {
-            int startPosition = 0;
-            while (startPosition < pagesIndex.getPositionCount()) {
-                int endPosition = findGroupEnd(pagesIndex, preSortedPartitionHashStrategy, startPosition);
-                pagesIndex.sort(orderChannels, ordering, startPosition, endPosition);
-                startPosition = endPosition;
-            }
+        if (!outputPages.process()) {
+            return null;
         }
-    }
 
-    private void finishPagesIndex()
-    {
-        sortPagesIndexIfNecessary();
-        windowInfo.addIndex(pagesIndex);
+        if (outputPages.isFinished()) {
+            state = State.FINISHED;
+            return null;
+        }
+
+        pagesIndex.clear();
+        return outputPages.getResult();
     }
 
     // Assumes input grouped on relevant pagesHashStrategy columns
@@ -525,5 +473,232 @@ public class WindowOperator
     public void close()
     {
         driverWindowInfo.set(Optional.of(windowInfo.build()));
+    }
+
+    /**
+     * @return the unused section of the page, or null if fully applied.
+     * pagesIndex guaranteed to have at least one row after this method returns
+     */
+    private static Page updatePagesIndex(
+            Page page,
+            PagesIndex pagesIndexToBeUpdated,
+            int[] preGroupedChannels,
+            PagesHashStrategy preGroupedPartitionHashStrategy)
+    {
+        checkArgument(page.getPositionCount() > 0);
+
+        // TODO: Fix pagesHashStrategy to allow specifying channels for comparison, it currently requires us to rearrange the right side blocks in consecutive channel order
+        Page preGroupedPage = rearrangePage(page, preGroupedChannels);
+        if (pagesIndexToBeUpdated.getPositionCount() == 0 || pagesIndexToBeUpdated.positionEqualsRow(preGroupedPartitionHashStrategy, 0, 0, preGroupedPage)) {
+            // Find the position where the pre-grouped columns change
+            int groupEnd = findGroupEnd(preGroupedPage, preGroupedPartitionHashStrategy, 0);
+
+            // Add the section of the page that contains values for the current group
+            pagesIndexToBeUpdated.addPage(page.getRegion(0, groupEnd));
+
+            if (page.getPositionCount() - groupEnd > 0) {
+                // Save the remaining page, which may contain multiple partitions
+                return page.getRegion(groupEnd, page.getPositionCount() - groupEnd);
+            }
+            else {
+                // Page fully consumed
+                return null;
+            }
+        }
+        else {
+            // We had previous results buffered, but the new page starts with new group values
+            return page;
+        }
+    }
+
+    private class ProducePagesIndex
+            implements WorkProcessor.Transformation<Page, PagesIndex>
+    {
+        private final LocalMemoryContext memoryContext;
+        private PagesIndex inMemoryPagesIndex;
+        private int[] preGroupedChannels;
+        private PagesHashStrategy preGroupedPartitionHashStrategy;
+        private final List<Integer> orderChannels;
+        private final List<SortOrder> ordering;
+        private final WindowInfo.DriverWindowInfoBuilder windowInfo;
+
+        private ProducePagesIndex(
+                AggregatedMemoryContext memoryContext,
+                PagesIndex inMemoryPagesIndex,
+                int[] preGroupedChannels,
+                PagesHashStrategy preGroupedPartitionHashStrategy,
+                List<Integer> orderChannels,
+                List<SortOrder> ordering,
+                WindowInfo.DriverWindowInfoBuilder windowInfo)
+        {
+            this.memoryContext = memoryContext.newLocalMemoryContext(ProducePagesIndex.class.getSimpleName());
+            this.inMemoryPagesIndex = inMemoryPagesIndex;
+            this.preGroupedChannels = preGroupedChannels;
+            this.preGroupedPartitionHashStrategy = preGroupedPartitionHashStrategy;
+            this.orderChannels = orderChannels;
+            this.ordering = ordering;
+            this.windowInfo = windowInfo;
+        }
+
+        @Override
+        public ProcessorState<PagesIndex> process(Optional<Page> pageOptional)
+        {
+            boolean finishing = !pageOptional.isPresent();
+            if (finishing) {
+                memoryContext.close();
+                return finished();
+            }
+
+            Page page = pageOptional.get();
+            if (page.getPositionCount() == 0) {
+                return needsMoreData();
+            }
+
+            updatePagesIndex(page, inMemoryPagesIndex, preGroupedChannels, preGroupedPartitionHashStrategy);
+
+            // If we are finishing, then we have buffered a full group
+            if (finishing) {
+                updateMemoryUsage();
+                return ofResult(finishPagesIndex(), !finishing);
+            }
+
+            updateMemoryUsage();
+            return needsMoreData();
+        }
+
+        private void sortPagesIndexIfNecessary(PagesIndex currentPagesIndex)
+        {
+            if (currentPagesIndex.getPositionCount() > 1 && !orderChannels.isEmpty()) {
+                int startPosition = 0;
+                while (startPosition < currentPagesIndex.getPositionCount()) {
+                    int endPosition = findGroupEnd(currentPagesIndex, preSortedPartitionHashStrategy, startPosition);
+                    currentPagesIndex.sort(orderChannels, ordering, startPosition, endPosition);
+                    startPosition = endPosition;
+                }
+            }
+        }
+
+        private PagesIndex finishPagesIndex()
+        {
+            sortPagesIndexIfNecessary(inMemoryPagesIndex);
+            windowInfo.addIndex(inMemoryPagesIndex);
+
+            return inMemoryPagesIndex;
+        }
+
+        private void updateMemoryUsage()
+        {
+            long bytes = 0;
+            if (inMemoryPagesIndex != null) {
+                bytes += inMemoryPagesIndex.getEstimatedSize().toBytes();
+            }
+
+            memoryContext.setBytes(bytes);
+        }
+    }
+
+    private class ProduceWindowResultsPerPartition
+            implements WorkProcessor.Transformation<WindowPartition, Page>
+    {
+        private final PageBuilder pageBuilder;
+        private final LocalMemoryContext memoryContext;
+
+        private ProduceWindowResultsPerPartition(PageBuilder pageBuilder,
+                AggregatedMemoryContext memoryContext)
+        {
+            this.pageBuilder = pageBuilder;
+            this.memoryContext = memoryContext.newLocalMemoryContext(ProduceWindowResultsPerPartition.class.getSimpleName());
+        }
+
+        @Override
+        public ProcessorState<Page> process(Optional<WindowPartition> windowPartitionOptional)
+        {
+            if (!windowPartitionOptional.isPresent()) {
+                state = State.FINISHED;
+                // Output the remaining page if we have anything buffered
+                if (!pageBuilder.isEmpty()) {
+                    Page page = pageBuilder.build();
+                    pageBuilder.reset();
+                    return ofResult(page, false);
+                }
+
+                return finished();
+            }
+
+            windowPartitionOptional.get().processNextRow(pageBuilder);
+
+            if (!pageBuilder.isFull()) {
+                state = State.NEEDS_INPUT;
+                return needsMoreData();
+            }
+
+            updateMemoryUsage();
+
+            return ofResult(pageBuilder.build());
+        }
+
+        private void updateMemoryUsage()
+        {
+            long bytes = 0;
+            if (pageBuilder != null) {
+                bytes += pageBuilder.getSizeInBytes();
+            }
+
+            memoryContext.setBytes(bytes);
+        }
+    }
+
+    private class ProducePartitions
+            implements WorkProcessor.Transformation<PagesIndex, WindowPartition>
+    {
+        private final LocalMemoryContext memoryContext;
+        private int partitionStart;
+        private PagesIndex pagesIndex;
+        private final List<FramedWindowFunction> windowFunctions;
+        private final WindowInfo.DriverWindowInfoBuilder windowInfo;
+
+        private ProducePartitions(
+                List<FramedWindowFunction> windowFunctions,
+                AggregatedMemoryContext memoryContext,
+                WindowInfo.DriverWindowInfoBuilder windowInfo)
+        {
+            this.windowFunctions = windowFunctions;
+            this.memoryContext = memoryContext.newLocalMemoryContext(ProduceWindowResultsPerPartition.class.getSimpleName());
+            this.partitionStart = 0;
+            this.windowInfo = windowInfo;
+        }
+
+        @Override
+        public ProcessorState<WindowPartition> process(Optional<PagesIndex> pagesIndexOptional)
+        {
+            if (!pagesIndexOptional.isPresent()) {
+                return finished();
+            }
+
+            pagesIndex = pagesIndexOptional.get();
+
+            if (partitionStart == pagesIndexOptional.get().getPositionCount()) {
+                memoryContext.close();
+                return finished();
+            }
+
+            updateMemoryUsage();
+            windowInfo.addIndex(pagesIndex);
+            int partitionEnd = findGroupEnd(pagesIndex, unGroupedPartitionHashStrategy, partitionStart);
+            WindowPartition partition = new WindowPartition(pagesIndex, partitionStart, partitionEnd, outputChannels, windowFunctions, peerGroupHashStrategy);
+            windowInfo.addPartition(partition);
+            partitionStart = partitionEnd;
+            return ofResult(partition);
+        }
+
+        private void updateMemoryUsage()
+        {
+            long bytes = 0;
+            if (pagesIndex != null) {
+                bytes += pagesIndex.getEstimatedSize().toBytes();
+            }
+
+            memoryContext.setBytes(bytes);
+        }
     }
 }
