@@ -1260,7 +1260,7 @@ public abstract class AbstractTestAggregations
                         "WHERE orderkey IN (1, 2, 3, 4, 5) " +
                         "GROUP BY GROUPING SETS ((), (orderpriority), (orderpriority, custkey))",
                 "VALUES " +
-                        "(NULL, NULL , ('F', 'O', 'O'))," +
+                        "(NULL, NULL , ('O', 'F', 'O'))," +
                         "('5-LOW', NULL , ('F', 'O'))," +
                         "('1-URGENT', NULL , ('O'))," +
                         "('5-LOW', 370 , NULL)," +
