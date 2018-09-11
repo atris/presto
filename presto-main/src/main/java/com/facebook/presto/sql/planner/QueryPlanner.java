@@ -425,19 +425,6 @@ class QueryPlanner
                 analysis.getParameters());
     }
 
-    private boolean isFilterClausePresent(QuerySpecification node)
-    {
-        final AtomicBoolean isFilterPresentInAggregate = new AtomicBoolean(false);
-        analysis.getAggregates(node).stream().forEach(currentAggregate -> {
-            if (currentAggregate.getFilter().isPresent()) {
-                isFilterPresentInAggregate.compareAndSet(false, true);
-                return;
-            }
-        });
-
-        return isFilterPresentInAggregate.get();
-    }
-
     private PlanBuilder aggregate(PlanBuilder subPlan, QuerySpecification node)
     {
         if (!analysis.isAggregation(node)) {
@@ -479,15 +466,14 @@ class QueryPlanner
 
         Optional<List<FunctionCallWithFinalArguments>> functionCallWithFinalArgumentsOptional = Optional.empty();
 
-        if (isFilterClausePresent(node)) {
+        if (!filterArguments.isEmpty()) {
             List<FunctionCallWithFinalArguments> functionCallWithFinalArguments = new ArrayList<>();
             Iterable<Expression> groupByAndSortArguments = Iterables.concat(groupByExpressions, sortArguments);
 
             Pair<PlanBuilder, List<Expression>> resultPair = projectFilteredAggregationSource(
-                                                                subPlan,
-                                                                analysis.getAggregates(node),
-                                                                ImmutableList.copyOf(groupByAndSortArguments),
-                                                                functionCallWithFinalArguments);
+                    subPlan,
+                    node,
+                    ImmutableList.copyOf(groupByAndSortArguments));
 
             subPlan = resultPair.getKey();
             List<Expression> argumentsAfterFilterReplacements = resultPair.getValue();
@@ -591,34 +577,20 @@ class QueryPlanner
         // 2.d. Rewrite aggregates
         ImmutableMap.Builder<Symbol, Aggregation> aggregationsBuilder = ImmutableMap.builder();
         boolean needPostProjectionCoercion = false;
+        for (FunctionCall aggregate : analysis.getAggregates(node)) {
+            Expression rewritten = argumentTranslations.rewrite(aggregate);
+            Symbol newSymbol = symbolAllocator.newSymbol(rewritten, analysis.getType(aggregate));
 
-        if (functionCallWithFinalArgumentsOptional.isPresent()) {
-            for (FunctionCallWithFinalArguments currentObject : functionCallWithFinalArgumentsOptional.get()) {
-                FunctionCall aggregate = currentObject.getFunctionCall();
-                Expression rewritten = argumentTranslations.rewrite(aggregate);
-
-                // TODO: this is a hack, because we apply coercions to the output of expressions, rather than the arguments to expressions.
-                // Therefore we can end up with this implicit cast, and have to move it into a post-projection
-                if (rewritten instanceof Cast) {
-                    rewritten = ((Cast) rewritten).getExpression();
-                    needPostProjectionCoercion = true;
-                }
-
-                if (aggregate.getFilter().isPresent()) {
-                    if (currentObject.getFinalArguments() == null) {
-                        throw new IllegalStateException("Aggregate's final arguments should have been present");
-                    }
-
-                    FunctionCall functionCall = new FunctionCall(aggregate.getName(), aggregate.isDistinct(), currentObject.getFinalArguments(), aggregate.getOrderBy(), aggregate.getFilter());
-
-                    rewritten = argumentTranslations.rewrite(functionCall);
-                }
-
-                Symbol newSymbol = symbolAllocator.newSymbol(rewritten, analysis.getType(aggregate));
-                aggregationTranslations.put(aggregate, newSymbol);
-
-                aggregationsBuilder.put(newSymbol, new Aggregation((FunctionCall) rewritten, analysis.getFunctionSignature(aggregate), Optional.empty()));
+            // TODO: this is a hack, because we apply coercions to the output of expressions, rather than the arguments to expressions.
+            // Therefore we can end up with this implicit cast, and have to move it into a post-projection
+            if (rewritten instanceof Cast) {
+                rewritten = ((Cast) rewritten).getExpression();
+                needPostProjectionCoercion = true;
             }
+
+            aggregationTranslations.put(aggregate, newSymbol);
+
+            aggregationsBuilder.put(newSymbol, new Aggregation((FunctionCall) rewritten, analysis.getFunctionSignature(aggregate), Optional.empty()));
         }
         Map<Symbol, Aggregation> aggregations = aggregationsBuilder.build();
 
@@ -668,17 +640,19 @@ class QueryPlanner
 
     private Pair<PlanBuilder, List<Expression>> projectFilteredAggregationSource(
             PlanBuilder subPlan,
-            List<FunctionCall> aggregates,
-            List<Expression> groupAndSortArguments,
-            List<FunctionCallWithFinalArguments> functionCallToFinalArguments)
+            QuerySpecification node,
+            List<Expression> groupAndSortArguments)
     {
         TranslationMap translations = new TranslationMap(subPlan.getRelationPlan(), analysis, lambdaDeclarationToSymbolMap);
 
         Assignments.Builder projections = Assignments.builder();
         Assignments.Builder filterArguments = Assignments.builder();
+        List<FunctionCall> rewrittenAggregates = new ArrayList<>();
+        List<FunctionCall> aggregates = analysis.getAggregates(node);
+
         List<Expression> cumulativeArgumentsPostProcessing = new ArrayList<>();
         for (FunctionCall aggregate : aggregates) {
-            Pair<FunctionCallWithFinalArguments, List<Expression>> argumentsPostProcessing;
+            Pair<FunctionCall, List<Expression>> argumentsPostProcessing;
             Expression filterExpression;
             Symbol filterSymbol;
 
@@ -695,8 +669,10 @@ class QueryPlanner
             }
 
             cumulativeArgumentsPostProcessing.addAll(argumentsPostProcessing.getValue());
-            functionCallToFinalArguments.add(argumentsPostProcessing.getKey());
+            rewrittenAggregates.add(argumentsPostProcessing.getKey());
         }
+
+        analysis.setAggregates(node, rewrittenAggregates);
 
         // Add the remaining arguments to projection
         for (Expression expression : groupAndSortArguments) {
@@ -719,7 +695,7 @@ class QueryPlanner
                 analysis.getParameters()), cumulativeArgumentsPostProcessing);
     }
 
-    private Pair<FunctionCallWithFinalArguments, List<Expression>> processAggregateWithFilter(
+    private Pair<FunctionCall, List<Expression>> processAggregateWithFilter(
             PlanBuilder subPlan,
             FunctionCall aggregate,
             Symbol filterSymbol,
@@ -755,12 +731,15 @@ class QueryPlanner
             argumentsAfterFilter.add(caseExpression);
         }
 
-        FunctionCallWithFinalArguments functionCallWithFinalArguments = new FunctionCallWithFinalArguments(aggregate, argumentsAfterFilter);
+        FunctionCall functionCall = new FunctionCall(aggregate.getName(), aggregate.isDistinct(), argumentsAfterFilter, aggregate.getOrderBy(), aggregate.getFilter());
 
-        return new Pair(functionCallWithFinalArguments, argumentsAfterFilter);
+        analysis.addTypes(ImmutableMap.of(NodeRef.of(functionCall), analysis.getTypeWithCoercions(aggregate)));
+        analysis.addFunctionSignatures(ImmutableMap.of(NodeRef.of(functionCall), analysis.getFunctionSignature(aggregate)));
+
+        return new Pair(functionCall, argumentsAfterFilter);
     }
 
-    private Pair<FunctionCallWithFinalArguments, List<Expression>> processAggregateWithoutFilter(
+    private Pair<FunctionCall, List<Expression>> processAggregateWithoutFilter(
             PlanBuilder subPlan,
             FunctionCall aggregate,
             TranslationMap translations,
@@ -784,9 +763,9 @@ class QueryPlanner
             argumentsAfterFilter.add(currentArgument);
         }
 
-        FunctionCallWithFinalArguments functionCallWithFinalArguments = new FunctionCallWithFinalArguments(aggregate, argumentsAfterFilter);
+        FunctionCall functionCall = new FunctionCall(aggregate.getName(), aggregate.isDistinct(), argumentsAfterFilter, aggregate.getOrderBy(), aggregate.getFilter());
 
-        return new Pair(functionCallWithFinalArguments, argumentsAfterFilter);
+        return new Pair(functionCall, argumentsAfterFilter);
     }
 
     private List<FunctionCallWithFinalArguments> generateMappingFromUnwrittenAggregates(QuerySpecification node)
