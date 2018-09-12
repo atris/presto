@@ -104,7 +104,7 @@ public class TestFilteredAggregations
                         "    ) AS t (v, k, name)" +
                         ")" +
                         "SELECT" +
-                        "    SUM(CAST(v AS BIGINT)) FILTER (WHERE name = 'good') AS col2\n" +
+                        "    SUM(CAST(v AS BIGINT)) FILTER (WHERE name = 'good') AS col2" +
                         "FROM test",
                 "VALUES (BIGINT '3')");
     }
